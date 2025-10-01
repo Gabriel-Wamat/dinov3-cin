@@ -7,7 +7,8 @@ from io import BytesIO
 # ========================
 # Configurações
 # ========================
-checkpoint_path = "checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"  # ajuste se baixou outro
+checkpoint_path = "checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth" 
+images_path = "images"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ========================
