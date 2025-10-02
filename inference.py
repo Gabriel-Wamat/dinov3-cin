@@ -1,70 +1,123 @@
-import sys
 import os
-sys.path.append(os.path.dirname(__file__))
-sys.path.append(os.path.join(os.path.dirname(__file__), "dinov3"))
-
+import sys
+import time
+import numpy as np
 import torch
-from torchvision import transforms
 from PIL import Image
+import matplotlib.pyplot as plt
 
-# ========================
-# Configurações
-# ========================
-checkpoint_path = "checkpoints/dinov3_vitl16_pretrain.pth"
-images_path = "images"
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# --- Ajuste do path para importar o SAM-HQ ---
+project_root = os.path.abspath("train/segment_anything_training")
+sys.path.append(project_root)
 
-# ========================
-# Carregar modelo DINOv3
-# ========================
-import models.vision_transformer as vits
+from segment_anything import sam_model_registry
 
-model = vits.__dict__["vit_large"](patch_size=16)
-state_dict = torch.load(checkpoint_path, map_location="cpu")
-model.load_state_dict(state_dict, strict=False)
-model.eval().to(device)
-
-print(f"✅ Modelo carregado no dispositivo: {device}")
-
-# ========================
-# Pré-processamento
-# ========================
-transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.485, 0.456, 0.406),
-                         std=(0.229, 0.224, 0.225)),
-])
-print("✅ Pré-processamento definido.")
-
-# ========================
-# Inferência em todas as imagens
-# ========================
-results = []
-image_files = [f for f in os.listdir(images_path) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-
-if not image_files:
-    print("⚠️ Nenhuma imagem encontrada em", images_path)
+# --- Dispositivo ---
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
 else:
-    for img_name in image_files:
-        img_path = os.path.join(images_path, img_name)
-        try:
-            img = Image.open(img_path).convert("RGB")
-            x = transform(img).unsqueeze(0).to(device)
+    DEVICE = "cpu"
+print(f"[INFO] Usando device: {DEVICE}")
 
-            with torch.no_grad():
-                output = model(x)
+# --- Função para carregar imagem e transformá-la ---
+def load_image(path, target_size):
+    image = Image.open(path).convert("RGB")
+    image_np = np.array(image)
+    orig_size = image_np.shape[:2]  # (H, W)
 
-            feat_vector = output[0].cpu().numpy()
-            results.append((img_name, feat_vector[:5]))  # salva só os 5 primeiros valores
-            print(f"✅ {img_name} -> Saída: {output.shape}")
-        except Exception as e:
-            print(f"❌ Erro ao processar {img_name}: {e}")
+    # resize proporcional
+    scale = target_size / max(orig_size)
+    new_w = int(orig_size[1] * scale)
+    new_h = int(orig_size[0] * scale)
+    image_resized = Image.fromarray(image_np).resize((new_w, new_h))
+    image_resized_np = np.array(image_resized)
 
-    # Salvar resultados
-    with open("inference_results.txt", "w") as f:
-        for name, vec in results:
-            f.write(f"{name}: {vec}\n")
+    torch_img = torch.as_tensor(image_resized_np, device=DEVICE).permute(2, 0, 1).contiguous()[None, :, :, :]
+    return torch_img, orig_size, image_np
 
-    print("✅ Inferência concluída. Resultados salvos em inference_results.txt")
+# --- Função para salvar máscara + overlay ---
+def save_mask(mask_np, image_np, save_mask_path, save_overlay_path):
+    os.makedirs(os.path.dirname(save_mask_path), exist_ok=True)
+    os.makedirs(os.path.dirname(save_overlay_path), exist_ok=True)
+
+    plt.imsave(save_mask_path, mask_np, cmap="gray")
+
+    plt.figure(figsize=(8, 8))
+    plt.imshow(image_np)
+    plt.imshow(mask_np, alpha=0.5, cmap="jet")
+    plt.axis("off")
+    plt.savefig(save_overlay_path, bbox_inches="tight", pad_inches=0)
+    plt.close()
+
+# --- Main de execução ---
+if __name__ == "__main__":
+    TARGET_SIZE = 2048
+    INPUT_DIR = "SAMfinos"
+    CHECKPOINT_PATH = "checkpoints/sam_hq_vit_h.pth"
+
+    print(f"[INFO] Carregando modelo ViT-H do checkpoint {CHECKPOINT_PATH}")
+    sam = sam_model_registry["vit_h"](checkpoint=CHECKPOINT_PATH)
+    sam.to(device=DEVICE)
+    sam.eval()
+    print("<All keys matched successfully>")
+
+    os.makedirs("results/logs", exist_ok=True)
+    os.makedirs("results/vis_masks", exist_ok=True)
+    os.makedirs("results/vis_overlay", exist_ok=True)
+
+    log_path = os.path.join("results", "logs", "inference_log.txt")
+    log_file = open(log_path, "w")
+
+    image_files = []
+    if os.path.isdir(INPUT_DIR):
+        for fname in os.listdir(INPUT_DIR):
+            if fname.lower().endswith((".jpg", ".png", ".jpeg")):
+                image_files.append(os.path.join(INPUT_DIR, fname))
+    else:
+        raise ValueError(f"Pasta de input '{INPUT_DIR}' não encontrada.")
+
+    total = len(image_files)
+    print(f"[INFO] Encontradas {total} imagens em {INPUT_DIR}")
+
+    for idx, img_path in enumerate(image_files, 1):
+        t0 = time.time()
+        torch_img, orig_size, orig_np = load_image(img_path, TARGET_SIZE)
+
+        # Aqui passa também o tamanho original!
+        batched = [{
+            "image": torch_img[0],
+            "original_size": orig_size
+        }]
+
+        with torch.no_grad():
+            outputs = sam(batched, multimask_output=False)
+
+        out = outputs[0]
+        masks = out["masks"]
+        iou_pred = out["iou_predictions"]
+
+        elapsed = time.time() - t0
+
+        log_str = (
+            f"Image: {img_path}\n"
+            f"Input tensor shape: {torch_img.shape}\n"
+            f"Final masks shape: {masks.shape}\n"
+            f"IoU predictions shape: {iou_pred.shape}\n"
+            f"Time (s): {elapsed:.3f}\n"
+            "---------------------------\n"
+        )
+        log_file.write(log_str)
+
+        progress = (idx / total) * 100
+        print(f"[{idx}/{total}] {img_path} processada ({progress:.1f}%)")
+
+        mask0 = masks[0][0].cpu().numpy()
+        basename = os.path.splitext(os.path.basename(img_path))[0]
+        mask_path = os.path.join("results", "vis_masks", f"{basename}_mask.png")
+        overlay_path = os.path.join("results", "vis_overlay", f"{basename}_overlay.png")
+        save_mask(mask0, orig_np, mask_path, overlay_path)
+
+    log_file.close()
+    print("[INFO] Inferência concluída. Resultados em pasta results/")
